@@ -1,0 +1,223 @@
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1">
+
+  <title>М70 — Сканер билетов</title>
+
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: Arial, sans-serif;
+      background: #f3f4f6;
+      margin: 0;
+      padding: 18px;
+    }
+
+    .container {
+      max-width: 460px;
+      margin: auto;
+      background: white;
+      padding: 22px;
+      border-radius: 14px;
+    }
+
+    h1 { margin-bottom: 5px; }
+
+    p { color: #666; }
+
+    button {
+      width: 100%;
+      padding: 15px;
+      margin-top: 12px;
+      border: none;
+      border-radius: 9px;
+      background: #222;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    button:disabled { opacity: .5; }
+
+    #reader {
+      width: 100%;
+      margin-top: 16px;
+    }
+
+    #result {
+      margin-top: 16px;
+      padding: 15px;
+      border-radius: 8px;
+      background: #edf2f7;
+      white-space: pre-line;
+    }
+
+    .success {
+      background: #d9f5df !important;
+    }
+
+    .error {
+      background: #ffdddd !important;
+    }
+
+    .counter {
+      margin-top: 14px;
+      text-align: center;
+      font-size: 18px;
+    }
+  </style>
+</head>
+
+<body>
+<div class="container">
+
+  <h1>М70 · Сканер</h1>
+  <p>Кооператив М70 · Томск</p>
+
+  <button id="startBtn" onclick="startScanner()">
+    📷 Начать сканирование
+  </button>
+
+  <button id="stopBtn"
+          onclick="stopScanner()"
+          disabled>
+    Остановить камеру
+  </button>
+
+  <div id="reader"></div>
+
+  <div id="result" role="status">
+    Камера выключена
+  </div>
+
+  <div class="counter">
+    Распознано: <strong id="count">0</strong>
+  </div>
+
+  <p>
+    Тестовый режим: QR-коды распознаются,
+    но отметка прихода пока не выполняется.
+  </p>
+
+</div>
+
+<script>
+  let scanner = null;
+  let running = false;
+  let count = 0;
+
+  let lastToken = '';
+  let lastScanTime = 0;
+
+  function showResult(message, type = '') {
+    const box = document.getElementById('result');
+    box.textContent = message;
+    box.className = type;
+  }
+
+  function onScanSuccess(decodedText) {
+    const now = Date.now();
+
+    // Один и тот же QR не считаем много раз подряд.
+    if (
+      decodedText === lastToken &&
+      now - lastScanTime < 4000
+    ) {
+      return;
+    }
+
+    lastToken = decodedText;
+    lastScanTime = now;
+
+    count++;
+    document.getElementById('count').textContent = count;
+
+    showResult(
+      '✓ QR-код распознан\n' +
+      'Сканирование продолжается',
+      'success'
+    );
+
+    if (navigator.vibrate) {
+      navigator.vibrate(100);
+    }
+  }
+
+  async function startScanner() {
+    if (running) return;
+
+    if (typeof Html5Qrcode === 'undefined') {
+      showResult('Библиотека сканирования не загружена', 'error');
+      return;
+    }
+
+    const startBtn = document.getElementById('startBtn');
+    startBtn.disabled = true;
+
+    try {
+      scanner = new Html5Qrcode('reader');
+
+      await scanner.start(
+        { facingMode: 'environment' },
+        {
+          fps: 10,
+          qrbox: function(width, height) {
+            const size = Math.min(
+              250, width * 0.75, height * 0.75
+            );
+
+            return {
+              width: Math.floor(size),
+              height: Math.floor(size)
+            };
+          }
+        },
+        onScanSuccess,
+        function() {
+          // Ожидание очередного QR — не ошибка.
+        }
+      );
+
+      running = true;
+
+      document.getElementById('stopBtn').disabled = false;
+      showResult('Камера работает. Наведите на QR-код.');
+
+    } catch (error) {
+      showResult(
+        'Не удалось открыть камеру: ' + error.message,
+        'error'
+      );
+      startBtn.disabled = false;
+    }
+  }
+
+  async function stopScanner() {
+    if (!scanner || !running) return;
+
+    try {
+      await scanner.stop();
+      scanner.clear();
+
+      running = false;
+      scanner = null;
+
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = true;
+
+      showResult('Камера остановлена');
+
+    } catch (error) {
+      showResult('Ошибка остановки: ' + error.message, 'error');
+    }
+  }
+</script>
+</body>
+</html>
