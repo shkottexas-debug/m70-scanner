@@ -1,256 +1,51 @@
-
 <!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport"
-        content="width=device-width, initial-scale=1">
-
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
   <title>М70 — Сканер билетов</title>
-
-  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
-
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js" defer></script>
+  <script src="scanner.js" defer></script>
   <style>
     * { box-sizing: border-box; }
-
-    body {
-      font-family: Arial, sans-serif;
-      background: #f3f4f6;
-      margin: 0;
-      padding: 18px;
-    }
-
-    .container {
-      max-width: 460px;
-      margin: auto;
-      background: white;
-      padding: 22px;
-      border-radius: 14px;
-    }
-
-    h1 { margin-bottom: 5px; }
-
-    p { color: #666; }
-
-    button {
-      width: 100%;
-      padding: 15px;
-      margin-top: 12px;
-      border: none;
-      border-radius: 9px;
-      background: #222;
-      color: white;
-      font-size: 16px;
-      cursor: pointer;
-    }
-
-    button:disabled { opacity: .5; }
-
-    #reader {
-      width: 100%;
-      margin-top: 16px;
-    }
-
-    #result {
-      margin-top: 16px;
-      padding: 15px;
-      border-radius: 8px;
-      background: #edf2f7;
-      white-space: pre-line;
-    }
-
-    .success {
-      background: #d9f5df !important;
-    }
-
-    .error {
-      background: #ffdddd !important;
-    }
-
-    .counter {
-      margin-top: 14px;
-      text-align: center;
-      font-size: 18px;
-    }
+    body { font-family: Arial, sans-serif; background: #f3f4f6; margin: 0; padding: 18px; color: #222; }
+    .container { max-width: 460px; margin: auto; background: white; padding: 22px; border-radius: 14px; box-shadow: 0 8px 28px rgb(15 23 42 / 8%); }
+    h1 { margin: 0 0 5px; }
+    p { color: #566070; }
+    button, .file-button { display: block; width: 100%; padding: 15px; margin-top: 12px; border: none; border-radius: 9px; background: #222; color: white; font: inherit; font-size: 16px; text-align: center; cursor: pointer; }
+    button.secondary, .file-button.secondary { background: #475569; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    input[type="file"] { display: none; }
+    #reader { width: 100%; margin-top: 16px; overflow: hidden; border-radius: 10px; }
+    #result { margin-top: 16px; padding: 15px; border-radius: 8px; background: #edf2f7; white-space: pre-line; min-height: 52px; }
+    #result.success { background: #d9f5df; }
+    #result.warning { background: #fff4cc; }
+    #result.error { background: #ffdddd; }
+    .counters { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; text-align: center; }
+    .counter { padding: 10px; border-radius: 8px; background: #f8fafc; }
+    .counter strong { display: block; font-size: 22px; }
+    #mode { font-size: 14px; font-weight: 700; }
   </style>
 </head>
-
 <body>
-<div class="container">
-
-  <h1>М70 · Сканер</h1>
-  <p>Кооператив М70 · Томск</p>
-
-  <button id="startBtn" onclick="startScanner()">
-    📷 Начать сканирование
-  </button>
-
-  <button id="stopBtn"
-          onclick="stopScanner()"
-          disabled>
-    Остановить камеру
-  </button>
-
-  <button onclick="testConnection()">
-    Проверить связь с Google Apps Script
-  </button>
-
-  <div id="reader"></div>
-
-  <div id="result" role="status">
-    Камера выключена
-  </div>
-
-  <div class="counter">
-    Распознано: <strong id="count">0</strong>
-  </div>
-
-  <p>
-    Тестовый режим: QR-коды распознаются,
-    но отметка прихода пока не выполняется.
-  </p>
-
-</div>
-
-<script>
-  let scanner = null;
-  let running = false;
-  let count = 0;
-
-  const scannedTokens = new Set();
-
-  function showResult(message, type = '') {
-    const box = document.getElementById('result');
-    box.textContent = message;
-    box.className = type;
-  }
-
-  function onScanSuccess(decodedText) {
-    const now = Date.now();
-
-    // Один и тот же QR не считаем много раз подряд.
-    if (
-      decodedText === lastToken &&
-      now - lastScanTime < 4000
-    ) {
-      return;
-    }
-
-    lastToken = decodedText;
-    lastScanTime = now;
-
-    count++;
-    document.getElementById('count').textContent = count;
-
-    showResult(
-      '✓ QR-код распознан\n' +
-      'Сканирование продолжается',
-      'success'
-    );
-
-    if (navigator.vibrate) {
-      navigator.vibrate(100);
-    }
-  }
-
-  async function startScanner() {
-    if (running) return;
-
-    if (typeof Html5Qrcode === 'undefined') {
-      showResult('Библиотека сканирования не загружена', 'error');
-      return;
-    }
-
-    const startBtn = document.getElementById('startBtn');
-    startBtn.disabled = true;
-
-    try {
-      scanner = new Html5Qrcode('reader');
-
-      await scanner.start(
-        { facingMode: 'environment' },
-        {
-          fps: 10,
-          qrbox: function(width, height) {
-            const size = Math.min(
-              250, width * 0.75, height * 0.75
-            );
-
-            return {
-              width: Math.floor(size),
-              height: Math.floor(size)
-            };
-          }
-        },
-        onScanSuccess,
-        
-function onScanSuccess(decodedText) {
-  const token = decodedText.trim();
-
-  // Повторно один QR не учитываем.
-  if (scannedTokens.has(token)) {
-    return;
-  }
-
-  scannedTokens.add(token);
-
-  count = scannedTokens.size;
-
-  document.getElementById('count').textContent = count;
-
-  showResult(
-    '✓ Новый QR-код распознан\n' +
-    'Уникальных QR: ' + count + '\n' +
-    'Сканирование продолжается',
-    'success'
-  );
-
-  if (navigator.vibrate) {
-    navigator.vibrate(100);
-  }
-}
-
-
-  async function stopScanner() {
-    if (!scanner || !running) return;
-
-    try {
-      await scanner.stop();
-      scanner.clear();
-
-      running = false;
-      scanner = null;
-
-      document.getElementById('startBtn').disabled = false;
-      document.getElementById('stopBtn').disabled = true;
-
-      showResult('Камера остановлена');
-
-    } catch (error) {
-      showResult('Ошибка остановки: ' + error.message, 'error');
-    }
-  }
-  
-function testConnection() {
-  if (!window.opener || window.opener.closed) {
-    showResult(
-      'Нет связи с окном Apps Script. Откройте сканер из приложения М70.',
-      'error'
-    );
-    return;
-  }
-
-  // Только тестовое сообщение, без токенов.
-  window.opener.postMessage(
-    { type: 'M70_TEST' },
-    '*'
-  );
-
-  showResult(
-    'Тестовое сообщение отправлено. Проверьте окно Apps Script.'
-  );
-}
-
-</script>
+  <main class="container">
+    <h1>М70 · Сканер</h1>
+    <p>Кооператив М70 · Томск</p>
+    <p id="mode">Определение режима…</p>
+    <button id="startBtn" type="button">📷 Начать сканирование</button>
+    <button id="stopBtn" type="button" class="secondary" disabled>Остановить камеру</button>
+    <label for="photoInput" class="file-button secondary">Выбрать фотографию QR</label>
+    <input id="photoInput" type="file" accept="image/*" capture="environment">
+    <button id="testBtn" type="button" class="secondary">Проверить связь с Google Apps Script</button>
+    <button id="retryBtn" type="button" class="secondary" hidden>Повторить отправку</button>
+    <div id="reader"></div>
+    <div id="result" role="status" aria-live="polite">Камера выключена</div>
+    <div class="counters">
+      <div class="counter">Распознано<strong id="count">0</strong></div>
+      <div class="counter">Подтверждено<strong id="confirmedCount">0</strong></div>
+    </div>
+    <p>В тестовом режиме QR только распознаются. Для отметки прихода откройте сканер кнопкой из авторизованного приложения регистратора.</p>
+  </main>
 </body>
 </html>
