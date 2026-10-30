@@ -113,8 +113,7 @@
   let running = false;
   let count = 0;
 
-  let lastToken = '';
-  let lastScanTime = 0;
+  const scannedTokens = new Set();
 
   function showResult(message, type = '') {
     const box = document.getElementById('result');
@@ -180,24 +179,33 @@
           }
         },
         onScanSuccess,
-        function() {
-          // Ожидание очередного QR — не ошибка.
-        }
-      );
+        
+function onScanSuccess(decodedText) {
+  const token = decodedText.trim();
 
-      running = true;
-
-      document.getElementById('stopBtn').disabled = false;
-      showResult('Камера работает. Наведите на QR-код.');
-
-    } catch (error) {
-      showResult(
-        'Не удалось открыть камеру: ' + error.message,
-        'error'
-      );
-      startBtn.disabled = false;
-    }
+  // Повторно один QR не учитываем.
+  if (scannedTokens.has(token)) {
+    return;
   }
+
+  scannedTokens.add(token);
+
+  count = scannedTokens.size;
+
+  document.getElementById('count').textContent = count;
+
+  showResult(
+    '✓ Новый QR-код распознан\n' +
+    'Уникальных QR: ' + count + '\n' +
+    'Сканирование продолжается',
+    'success'
+  );
+
+  if (navigator.vibrate) {
+    navigator.vibrate(100);
+  }
+}
+
 
   async function stopScanner() {
     if (!scanner || !running) return;
