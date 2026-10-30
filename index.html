@@ -91,6 +91,10 @@
     Остановить камеру
   </button>
 
+  <button onclick="testConnection()">
+    Проверить связь с Google Apps Script
+  </button>
+
   <div id="reader"></div>
 
   <div id="result" role="status">
@@ -226,6 +230,27 @@ function onScanSuccess(decodedText) {
       showResult('Ошибка остановки: ' + error.message, 'error');
     }
   }
+  
+function testConnection() {
+  if (!window.opener || window.opener.closed) {
+    showResult(
+      'Нет связи с окном Apps Script. Откройте сканер из приложения М70.',
+      'error'
+    );
+    return;
+  }
+
+  // Только тестовое сообщение, без токенов.
+  window.opener.postMessage(
+    { type: 'M70_TEST' },
+    '*'
+  );
+
+  showResult(
+    'Тестовое сообщение отправлено. Проверьте окно Apps Script.'
+  );
+}
+
 </script>
 </body>
 </html>
