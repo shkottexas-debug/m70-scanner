@@ -13,6 +13,7 @@ const FIRST_DATA_ROW = 2;
 const LOCK_TIMEOUT_MS = 10000;
 const SCANNER_ORIGIN = 'https://shkottexas-debug.github.io';
 const BRIDGE_SESSION_TTL_MS = 5 * 60 * 1000;
+const ELIGIBLE_STATUSES = ['Зарегистрирован', 'Подтвердил'];
 
 function doGet() {
   assertAuthorizedRegistrar_();
@@ -40,19 +41,21 @@ function healthCheck(requestId) {
   return { ok: true, requestId: requestId };
 }
 
-function createBridgeSession(channelId) {
+function createBridgeSession(channelId, bridgeOrigin) {
   assertAuthorizedRegistrar_();
   validateRequestId_(channelId);
+  validateBridgeOrigin_(bridgeOrigin);
   const privateKey = String(
     PropertiesService.getScriptProperties().getProperty('BRIDGE_PRIVATE_KEY') || ''
   ).trim();
   if (!privateKey) throw new Error('Не задан приватный ключ bridge-сессии.');
   const expiresAt = Date.now() + BRIDGE_SESSION_TTL_MS;
-  const payload = channelId + '\n' + expiresAt + '\n' + SCANNER_ORIGIN;
+  const payload = channelId + '\n' + expiresAt + '\n' + SCANNER_ORIGIN + '\n' + bridgeOrigin;
   const signature = Utilities.computeRsaSha256Signature(payload, privateKey);
   return {
     channelId: channelId,
     expiresAt: expiresAt,
+    bridgeOrigin: bridgeOrigin,
     signature: Utilities.base64Encode(signature)
   };
 }
@@ -85,6 +88,21 @@ function checkIn_(rawToken, requestId) {
     // если время было очищено вручную.
     if (arrivalTime || status === config.checkedInStatus) {
       return response_('already_used', 'Билет уже использован', requestId);
+    }
+
+    const eligibility = classifyEligibility_(status);
+    if (eligibility === 'cancelled') {
+      return response_('cancelled', 'Билет отменён. Проход запрещён.', requestId);
+    }
+    if (eligibility === 'blocked') {
+      return response_('blocked', 'Билет заблокирован. Проход запрещён.', requestId);
+    }
+    if (eligibility !== 'eligible') {
+      return response_(
+        'not_eligible',
+        'Текущий статус билета не разрешает проход.',
+        requestId
+      );
     }
 
     sheet.getRange(rowNumber, STATUS_COLUMN, 1, 2)
@@ -139,6 +157,26 @@ function validateRequestId_(requestId) {
       !/^[a-zA-Z0-9-]+$/.test(requestId)) {
     throw new Error('Некорректный идентификатор запроса.');
   }
+}
+
+function validateBridgeOrigin_(bridgeOrigin) {
+  if (typeof bridgeOrigin !== 'string' ||
+      !/^https:\/\/(?:script\.google\.com|[a-z0-9-]+\.googleusercontent\.com)$/.test(bridgeOrigin)) {
+    throw new Error('Некорректный origin приложения регистратора.');
+  }
+}
+
+function normalizeStatus_(status) {
+  return String(status || '').trim().toLocaleLowerCase('ru-RU').replace(/ё/g, 'е');
+}
+
+function classifyEligibility_(status) {
+  const normalized = normalizeStatus_(status);
+  const eligible = ELIGIBLE_STATUSES.map(normalizeStatus_);
+  if (eligible.indexOf(normalized) !== -1) return 'eligible';
+  if (/^(отмен|аннулир)/.test(normalized)) return 'cancelled';
+  if (/^(заблок|блокир)/.test(normalized)) return 'blocked';
+  return 'not_eligible';
 }
 
 function response_(status, message, requestId) {

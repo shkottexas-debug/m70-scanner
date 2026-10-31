@@ -1,8 +1,8 @@
 (function () {
   'use strict';
 
-  const BRIDGE_HOST_SUFFIX = '.googleusercontent.com';
   const REQUEST_TIMEOUT_MS = 15000;
+  const RESCAN_GAP_MS = 1500;
   const BRIDGE_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvkAkoJI3L+Xa8yAMyYSe
 c441cGIEj0HC+bHEJNXXN57+TMGA0um4VhKkD77Hkq9SDvDwgsBgC6Ucf3Jg2WyD
@@ -15,14 +15,19 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
   let scanner = null;
   let running = false;
   let cameraOperation = false;
+  let bridgeWindow = null;
   let bridgeOrigin = null;
   let bridgeChannelId = null;
+  let bridgeExpiresAt = 0;
   let bridgeConnected = false;
+  let bridgeExpiryTimer = null;
   let currentRequest = null;
   let retryToken = null;
   let confirmedCount = 0;
   const scannedTokens = new Set();
   const tokenStates = new Map();
+  const tokenRequestIds = new Map();
+  const tokenLastSeenAt = new Map();
   const pendingTokens = [];
   const elements = {};
   let importedBridgeKey = null;
@@ -43,33 +48,33 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
     return `m70-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
-  function getTrustedOpenerOrigin() {
-    if (!window.opener || window.opener.closed || !document.referrer) return null;
-    try {
-      const referrer = new URL(document.referrer);
-      const trusted = referrer.protocol === 'https:' &&
-        (referrer.hostname === 'script.google.com' || referrer.hostname.endsWith(BRIDGE_HOST_SUFFIX));
-      return trusted ? referrer.origin : null;
-    } catch (_error) {
-      return null;
-    }
-  }
-
   function setMode() {
-    elements.mode.textContent = bridgeConnected
+    elements.mode.textContent = isBridgeActive()
       ? 'Авторизованный режим · отметка прихода включена'
       : 'Тестовый режим · запись в таблицу отключена';
   }
 
-  function announceReadyToOpener() {
-    bridgeOrigin = getTrustedOpenerOrigin();
-    if (!bridgeOrigin) return setMode();
-    window.opener.postMessage({ type: 'M70_SCANNER_READY', version: 1 }, bridgeOrigin);
+  function isBridgeActive() {
+    return bridgeConnected && Date.now() < bridgeExpiresAt;
+  }
+
+  function expireBridgeSession() {
+    bridgeConnected = false;
+    if (bridgeExpiryTimer) clearTimeout(bridgeExpiryTimer);
+    bridgeExpiryTimer = null;
+    setMode();
+    if (!currentRequest) {
+      showResult('Сессия регистратора истекла. Ожидаем безопасное продление…', 'warning');
+    }
   }
 
   function postToBridge(message) {
-    if (!bridgeConnected || !bridgeOrigin || !window.opener || window.opener.closed) return false;
-    window.opener.postMessage(message, bridgeOrigin);
+    if (!isBridgeActive()) {
+      if (bridgeConnected) expireBridgeSession();
+      return false;
+    }
+    if (!bridgeWindow || !bridgeOrigin || bridgeWindow.closed) return false;
+    bridgeWindow.postMessage(message, bridgeOrigin);
     return true;
   }
 
@@ -93,13 +98,24 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
     return importedBridgeKey;
   }
 
-  async function verifyBridgeSession(data) {
+  function isAllowedBridgeOrigin(origin) {
+    try {
+      const parsed = new URL(origin);
+      return parsed.protocol === 'https:' &&
+        (parsed.hostname === 'script.google.com' || parsed.hostname.endsWith('.googleusercontent.com'));
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async function verifyBridgeSession(data, eventOrigin) {
     if (typeof data.channelId !== 'string' || typeof data.signature !== 'string' ||
-        !Number.isSafeInteger(data.expiresAt)) return false;
+        !Number.isSafeInteger(data.expiresAt) || data.bridgeOrigin !== eventOrigin ||
+        !isAllowedBridgeOrigin(eventOrigin)) return false;
     const now = Date.now();
     if (data.expiresAt <= now || data.expiresAt > now + 10 * 60 * 1000) return false;
     if (!window.crypto || !window.crypto.subtle) return false;
-    const payload = `${data.channelId}\n${data.expiresAt}\n${window.location.origin}`;
+    const payload = `${data.channelId}\n${data.expiresAt}\n${window.location.origin}\n${eventOrigin}`;
     try {
       return await window.crypto.subtle.verify(
         { name: 'RSASSA-PKCS1-v1_5' },
@@ -112,16 +128,24 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
     }
   }
 
-  async function acceptBridgeSession(data) {
-    if (!await verifyBridgeSession(data)) {
-      bridgeConnected = false;
-      bridgeChannelId = null;
-      setMode();
-      showResult('Не удалось подтвердить подлинность приложения регистратора.', 'error');
+  async function acceptBridgeSession(data, event) {
+    if (!await verifyBridgeSession(data, event.origin)) {
+      // Недоверенное окно не должно сбрасывать уже проверенную сессию.
+      if (!isBridgeActive()) {
+        setMode();
+        showResult('Не удалось подтвердить подлинность приложения регистратора.', 'error');
+      }
       return;
     }
+    if (bridgeChannelId && (data.channelId !== bridgeChannelId ||
+        event.source !== bridgeWindow || event.origin !== bridgeOrigin)) return;
+    bridgeWindow = event.source;
+    bridgeOrigin = event.origin;
     bridgeChannelId = data.channelId;
+    bridgeExpiresAt = data.expiresAt;
     bridgeConnected = true;
+    if (bridgeExpiryTimer) clearTimeout(bridgeExpiryTimer);
+    bridgeExpiryTimer = setTimeout(expireBridgeSession, Math.max(0, bridgeExpiresAt - Date.now()));
     setMode();
     postToBridge({ type: 'M70_SCANNER_CONNECTED', channelId: bridgeChannelId });
     showResult('Связь с приложением регистратора установлена.', 'success');
@@ -129,14 +153,14 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
   }
 
   function onBridgeMessage(event) {
-    if (!bridgeOrigin || event.origin !== bridgeOrigin || event.source !== window.opener) return;
     const data = event.data;
     if (!data || typeof data !== 'object') return;
 
     if (data.type === 'M70_BRIDGE_INIT') {
-      acceptBridgeSession(data);
+      acceptBridgeSession(data, event);
       return;
     }
+    if (!bridgeOrigin || event.origin !== bridgeOrigin || event.source !== bridgeWindow) return;
     if (data.channelId !== bridgeChannelId) return;
 
     if (data.type === 'M70_TEST_RESULT') {
@@ -162,17 +186,22 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
   function onScanSuccess(decodedText) {
     const token = typeof decodedText === 'string' ? decodedText.trim() : '';
     if (!token) return showResult('QR-код пуст или повреждён.', 'error');
+    const now = Date.now();
+    const previousSeenAt = tokenLastSeenAt.get(token) || 0;
+    tokenLastSeenAt.set(token, now);
     if (scannedTokens.has(token)) {
-      if (tokenStates.get(token) === 'already_used') showResult('Билет уже использован', 'warning');
+      const state = tokenStates.get(token);
+      if (state === 'already_used') showResult('Билет уже использован', 'warning');
+      if (state === 'failed' && now - previousSeenAt >= RESCAN_GAP_MS) retryFailedToken(token);
       return;
     }
 
     scannedTokens.add(token);
-    tokenStates.set(token, bridgeConnected ? 'queued' : 'test_only');
+    tokenStates.set(token, isBridgeActive() ? 'queued' : 'test_only');
     updateRecognizedCount();
     if (navigator.vibrate) navigator.vibrate(100);
 
-    if (!bridgeConnected) {
+    if (!isBridgeActive()) {
       showResult(`✓ Новый QR-код распознан\nУникальных QR: ${scannedTokens.size}\nТестовый режим: отметка прихода не отправлена.`, 'success');
       return;
     }
@@ -182,9 +211,10 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
   }
 
   function pumpQueue() {
-    if (!bridgeConnected || currentRequest || pendingTokens.length === 0) return;
+    if (!isBridgeActive() || currentRequest || pendingTokens.length === 0) return;
     const token = pendingTokens.shift();
-    const requestId = createRequestId();
+    const requestId = tokenRequestIds.get(token) || createRequestId();
+    tokenRequestIds.set(token, requestId);
     tokenStates.set(token, 'pending');
     const timeoutId = setTimeout(function () {
       if (!currentRequest || currentRequest.requestId !== requestId) return;
@@ -212,6 +242,7 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
     currentRequest = null;
     if (data.status === 'checked_in') {
       tokenStates.set(token, 'checked_in');
+      tokenRequestIds.delete(token);
       confirmedCount += 1;
       elements.confirmedCount.textContent = String(confirmedCount);
       retryToken = null;
@@ -219,22 +250,33 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
       showResult('✓ Приход отмечен\nСканирование продолжается', 'success');
     } else if (data.status === 'already_used') {
       tokenStates.set(token, 'already_used');
+      tokenRequestIds.delete(token);
       retryToken = null;
       elements.retryBtn.hidden = true;
       showResult('Билет уже использован', 'warning');
+    } else if (['cancelled', 'blocked', 'not_eligible', 'not_found'].includes(data.status)) {
+      tokenStates.set(token, data.status);
+      tokenRequestIds.delete(token);
+      retryToken = null;
+      elements.retryBtn.hidden = true;
+      showResult(data.message || 'Проход по этому билету запрещён.', 'error');
     } else {
       tokenStates.set(token, 'failed');
       retryToken = token;
       elements.retryBtn.hidden = false;
-      showResult(data.status === 'not_found' ? 'Билет не найден. Приход не отмечен.' : `Ошибка: ${data.message || 'приход не подтверждён'}`, 'error');
+      showResult(`Ошибка: ${data.message || 'приход не подтверждён'}`, 'error');
     }
-    pumpQueue();
+    if (tokenStates.get(token) !== 'failed') pumpQueue();
   }
 
-  function retryFailedToken() {
-    if (!retryToken || tokenStates.get(retryToken) !== 'failed') return;
-    tokenStates.set(retryToken, 'queued');
-    pendingTokens.push(retryToken);
+  function retryFailedToken(token = retryToken) {
+    if (!token || tokenStates.get(token) !== 'failed') return;
+    if (!isBridgeActive()) {
+      showResult('Сессия регистратора недоступна. Дождитесь безопасного переподключения.', 'error');
+      return;
+    }
+    tokenStates.set(token, 'queued');
+    pendingTokens.push(token);
     retryToken = null;
     elements.retryBtn.hidden = true;
     showResult('Повторная проверка билета…');
@@ -317,7 +359,7 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
   }
 
   function testConnection() {
-    if (!bridgeConnected) return showResult('Нет авторизованной связи. Откройте сканер кнопкой из приложения регистратора Apps Script.', 'error');
+    if (!isBridgeActive()) return showResult('Нет активной авторизованной связи. Откройте сканер кнопкой из приложения регистратора Apps Script.', 'error');
     if (currentRequest) return showResult('Дождитесь завершения текущей проверки билета.', 'warning');
     const requestId = createRequestId();
     elements.testBtn.disabled = true;
@@ -343,16 +385,15 @@ dneyNyf2YdHpnA1JtronTUxwqHmqDG0QwlZtx1JNmF3jPeftvZgt+Ff3c9oj+oyi
     elements.startBtn.addEventListener('click', function () { startScanner(); });
     elements.stopBtn.addEventListener('click', function () { stopScanner(); });
     elements.testBtn.addEventListener('click', testConnection);
-    elements.retryBtn.addEventListener('click', retryFailedToken);
+    elements.retryBtn.addEventListener('click', function () { retryFailedToken(); });
     elements.photoInput.addEventListener('change', scanPhoto);
     window.addEventListener('message', onBridgeMessage);
     window.addEventListener('pagehide', function () {
       if (scanner && running) scanner.stop().catch(function () {});
     });
     setMode();
-    announceReadyToOpener();
     if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-      window.__M70_TEST__ = { onScanSuccess };
+      window.__M70_TEST__ = { onScanSuccess, expireBridgeSession };
     }
   }
 

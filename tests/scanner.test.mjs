@@ -4,8 +4,15 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('../scanner.js', import.meta.url), 'utf8');
+const BRIDGE_ORIGIN = 'https://example-script.googleusercontent.com';
 
-function createHarness({ referrer = '', opener = null, bridgeVerified = true } = {}) {
+function unrefTimeout(callback, delay) {
+  const timer = setTimeout(callback, delay);
+  timer.unref();
+  return timer;
+}
+
+function createHarness({ bridgeVerified = true } = {}) {
   const listeners = new Map();
   const elements = new Map();
 
@@ -22,7 +29,6 @@ function createHarness({ referrer = '', opener = null, bridgeVerified = true } =
 
   const documentListeners = {};
   const document = {
-    referrer,
     getElementById: element,
     addEventListener(type, callback) { documentListeners[type] = callback; }
   };
@@ -37,7 +43,6 @@ function createHarness({ referrer = '', opener = null, bridgeVerified = true } =
   }
 
   const window = {
-    opener,
     Html5Qrcode: FakeScanner,
     crypto: {
       randomUUID: () => '12345678-1234-1234-1234-123456789012',
@@ -51,10 +56,26 @@ function createHarness({ referrer = '', opener = null, bridgeVerified = true } =
     addEventListener(type, callback) { listeners.set(type, callback); }
   };
   const context = vm.createContext({ window, document, navigator: { vibrate() {} },
-    URL, Math, Date, TextEncoder, setTimeout, clearTimeout });
+    URL, Math, Date, TextEncoder, setTimeout: unrefTimeout, clearTimeout });
   vm.runInContext(source, context);
   documentListeners.DOMContentLoaded();
   return { window, elements, listeners, FakeScanner };
+}
+
+async function connectBridge(app, bridgeWindow, overrides = {}) {
+  app.listeners.get('message')({
+    origin: overrides.origin || BRIDGE_ORIGIN,
+    source: bridgeWindow,
+    data: {
+      type: 'M70_BRIDGE_INIT',
+      channelId: 'trusted-channel',
+      expiresAt: Date.now() + 60000,
+      bridgeOrigin: overrides.bridgeOrigin || BRIDGE_ORIGIN,
+      signature: 'c2lnbmF0dXJl',
+      ...overrides.data
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 test('counts only unique QR codes in standalone test mode', () => {
@@ -75,37 +96,62 @@ test('starts camera once and keeps the success callback active', async () => {
   assert.equal(app.elements.get('count').textContent, '2');
 });
 
-test('ignores bridge messages from an unexpected origin', () => {
-  const opener = { closed: false, postMessage() {} };
-  const app = createHarness({ referrer: 'https://example-script.googleusercontent.com/', opener });
-  app.listeners.get('message')({ origin: 'https://attacker.example', source: opener,
-    data: { type: 'M70_BRIDGE_INIT', channelId: 'bad-channel' } });
+test('ignores unsigned bridge messages from an unexpected origin', async () => {
+  const bridgeWindow = { closed: false, postMessage() {} };
+  const app = createHarness();
+  await connectBridge(app, bridgeWindow, {
+    origin: 'https://attacker.example',
+    bridgeOrigin: 'https://attacker.example'
+  });
   assert.match(app.elements.get('mode').textContent, /Тестовый режим/);
 });
 
-test('accepts a signed Apps Script opener handshake without putting a token in URL', async () => {
+test('accepts a signed parent-initiated session without referrer or URL credentials', async () => {
   const messages = [];
-  const opener = { closed: false, postMessage(message, origin) { messages.push({ message, origin }); } };
-  const origin = 'https://example-script.googleusercontent.com';
-  const app = createHarness({ referrer: origin + '/', opener });
-  app.listeners.get('message')({ origin, source: opener,
-    data: { type: 'M70_BRIDGE_INIT', channelId: 'trusted-channel',
-      expiresAt: Date.now() + 60000, signature: 'c2lnbmF0dXJl' } });
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  const bridgeWindow = { closed: false, postMessage(message, origin) { messages.push({ message, origin }); } };
+  const app = createHarness();
+  await connectBridge(app, bridgeWindow);
+
   assert.match(app.elements.get('mode').textContent, /Авторизованный режим/);
-  assert.equal(messages[0].message.type, 'M70_SCANNER_READY');
-  assert.equal(messages[0].origin, origin);
+  assert.equal(messages[0].message.type, 'M70_SCANNER_CONNECTED');
+  assert.equal(messages[0].origin, BRIDGE_ORIGIN);
+});
+
+test('an invalid init cannot disconnect an already verified session', async () => {
+  const bridgeWindow = { closed: false, postMessage() {} };
+  const app = createHarness();
+  await connectBridge(app, bridgeWindow);
+  await connectBridge(app, { closed: false, postMessage() {} }, {
+    origin: 'https://attacker.example',
+    bridgeOrigin: 'https://attacker.example'
+  });
+  assert.match(app.elements.get('mode').textContent, /Авторизованный режим/);
+});
+
+test('a signed replay from another window cannot replace the verified parent', async () => {
+  const originalMessages = [];
+  const attackerMessages = [];
+  const bridgeWindow = {
+    closed: false,
+    postMessage(message) { originalMessages.push(message); }
+  };
+  const app = createHarness();
+  await connectBridge(app, bridgeWindow);
+  await connectBridge(app, {
+    closed: false,
+    postMessage(message) { attackerMessages.push(message); }
+  });
+  app.window.__M70_TEST__.onScanSuccess('token-a');
+
+  assert.equal(attackerMessages.length, 0);
+  assert.equal(originalMessages.filter((message) => message.type === 'M70_CHECKIN_REQUEST').length, 1);
 });
 
 test('queues two different QR codes and never sends a duplicate concurrently', async () => {
   const messages = [];
-  const opener = { closed: false, postMessage(message, origin) { messages.push({ message, origin }); } };
-  const origin = 'https://example-script.googleusercontent.com';
-  const app = createHarness({ referrer: origin + '/', opener });
-  app.listeners.get('message')({ origin, source: opener,
-    data: { type: 'M70_BRIDGE_INIT', channelId: 'trusted-channel',
-      expiresAt: Date.now() + 60000, signature: 'c2lnbmF0dXJl' } });
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  const bridgeWindow = { closed: false, postMessage(message, origin) { messages.push({ message, origin }); } };
+  const app = createHarness();
+  await connectBridge(app, bridgeWindow);
 
   app.window.__M70_TEST__.onScanSuccess('token-a');
   app.window.__M70_TEST__.onScanSuccess('token-a');
@@ -114,36 +160,50 @@ test('queues two different QR codes and never sends a duplicate concurrently', a
   assert.equal(firstRequest.message.token, 'token-a');
   assert.equal(messages.filter((entry) => entry.message.type === 'M70_CHECKIN_REQUEST').length, 1);
 
-  app.listeners.get('message')({ origin, source: opener,
+  app.listeners.get('message')({ origin: BRIDGE_ORIGIN, source: bridgeWindow,
     data: { type: 'M70_CHECKIN_RESULT', channelId: 'trusted-channel',
       requestId: firstRequest.message.requestId, status: 'checked_in' } });
   const requests = messages.filter((entry) => entry.message.type === 'M70_CHECKIN_REQUEST');
   assert.equal(requests.length, 2);
   assert.equal(requests[1].message.token, 'token-b');
   assert.equal(app.elements.get('confirmedCount').textContent, '1');
-  app.listeners.get('message')({ origin, source: opener,
-    data: { type: 'M70_CHECKIN_RESULT', channelId: 'trusted-channel',
-      requestId: requests[1].message.requestId, status: 'already_used' } });
 });
 
-test('does not show a false confirmation for a server error', async () => {
+test('retries an ambiguous failure with the same request id and never confirms it locally', async () => {
   const messages = [];
-  const opener = { closed: false, postMessage(message) { messages.push(message); } };
-  const origin = 'https://example-script.googleusercontent.com';
-  const app = createHarness({ referrer: origin + '/', opener });
-  app.listeners.get('message')({ origin, source: opener,
-    data: { type: 'M70_BRIDGE_INIT', channelId: 'trusted-channel',
-      expiresAt: Date.now() + 60000, signature: 'c2lnbmF0dXJl' } });
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  const bridgeWindow = { closed: false, postMessage(message) { messages.push(message); } };
+  const app = createHarness();
+  await connectBridge(app, bridgeWindow);
   app.window.__M70_TEST__.onScanSuccess('token-a');
-  const request = messages.find((message) => message.type === 'M70_CHECKIN_REQUEST');
-  app.listeners.get('message')({ origin, source: opener,
-    data: { type: 'M70_CHECKIN_RESULT', channelId: 'trusted-channel',
-      requestId: request.requestId, status: 'error', message: 'Сеть недоступна' } });
+  const first = messages.find((message) => message.type === 'M70_CHECKIN_REQUEST');
 
+  app.listeners.get('message')({ origin: BRIDGE_ORIGIN, source: bridgeWindow,
+    data: { type: 'M70_CHECKIN_RESULT', channelId: 'trusted-channel',
+      requestId: first.requestId, status: 'error', message: 'Сеть недоступна' } });
   assert.equal(app.elements.get('confirmedCount').textContent, '0');
   assert.equal(app.elements.get('retryBtn').hidden, false);
-  assert.match(app.elements.get('result').textContent, /Приход не подтверждён|Сеть недоступна/i);
+
+  app.elements.get('retryBtn').handlers.click();
+  const requests = messages.filter((message) => message.type === 'M70_CHECKIN_REQUEST');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].requestId, first.requestId);
+  app.listeners.get('message')({ origin: BRIDGE_ORIGIN, source: bridgeWindow,
+    data: { type: 'M70_CHECKIN_RESULT', channelId: 'trusted-channel',
+      requestId: first.requestId, status: 'already_used' } });
+  assert.equal(app.elements.get('confirmedCount').textContent, '0');
+  assert.match(app.elements.get('result').textContent, /уже использован/);
+});
+
+test('expires a bridge session and refuses subsequent check-in requests', async () => {
+  const messages = [];
+  const bridgeWindow = { closed: false, postMessage(message) { messages.push(message); } };
+  const app = createHarness();
+  await connectBridge(app, bridgeWindow, { data: { expiresAt: Date.now() + 15 } });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  app.window.__M70_TEST__.onScanSuccess('after-expiry');
+  assert.match(app.elements.get('mode').textContent, /Тестовый режим/);
+  assert.equal(messages.filter((message) => message.type === 'M70_CHECKIN_REQUEST').length, 0);
 });
 
 test('keeps photo scanning as a standalone fallback', async () => {
@@ -155,14 +215,10 @@ test('keeps photo scanning as a standalone fallback', async () => {
   assert.match(app.elements.get('result').textContent, /Новый QR-код распознан/);
 });
 
-test('rejects an Apps Script opener with an invalid server signature', async () => {
-  const opener = { closed: false, postMessage() {} };
-  const origin = 'https://example-script.googleusercontent.com';
-  const app = createHarness({ referrer: origin + '/', opener, bridgeVerified: false });
-  app.listeners.get('message')({ origin, source: opener,
-    data: { type: 'M70_BRIDGE_INIT', channelId: 'untrusted-channel',
-      expiresAt: Date.now() + 60000, signature: 'aW52YWxpZA==' } });
-  await new Promise((resolve) => setTimeout(resolve, 0));
+test('rejects an Apps Script parent with an invalid server signature', async () => {
+  const bridgeWindow = { closed: false, postMessage() {} };
+  const app = createHarness({ bridgeVerified: false });
+  await connectBridge(app, bridgeWindow);
   assert.match(app.elements.get('mode').textContent, /Тестовый режим/);
   assert.match(app.elements.get('result').textContent, /подлинность/);
 });

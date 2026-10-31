@@ -3,7 +3,6 @@
 <head>
   <base target="_top">
   <meta charset="UTF-8">
-  <meta name="referrer" content="origin">
   <style>
     body { font: 16px Arial, sans-serif; margin: 0; padding: 24px; background: #f3f4f6; }
     main { max-width: 480px; margin: auto; background: #fff; padding: 24px; border-radius: 14px; }
@@ -25,10 +24,18 @@
       'use strict';
       const SCANNER_URL = 'https://shkottexas-debug.github.io/m70-scanner/';
       const SCANNER_ORIGIN = 'https://shkottexas-debug.github.io';
+      const INIT_RETRY_MS = 500;
+      const INIT_MAX_ATTEMPTS = 20;
+      const RENEW_MARGIN_MS = 60 * 1000;
       let scannerWindow = null;
       let channelId = null;
+      let bridgeSession = null;
+      let bridgeExpiresAt = 0;
       let serverBusy = false;
       let bridgeStarting = false;
+      let initRetryTimer = null;
+      let renewalTimer = null;
+      let initAttempts = 0;
       const status = document.getElementById('status');
 
       function show(message, type) {
@@ -45,14 +52,87 @@
         if (scannerWindow && !scannerWindow.closed) scannerWindow.postMessage(message, SCANNER_ORIGIN);
       }
 
+      function clearBridgeTimers() {
+        if (initRetryTimer) clearInterval(initRetryTimer);
+        if (renewalTimer) clearTimeout(renewalTimer);
+        initRetryTimer = null;
+        renewalTimer = null;
+      }
+
+      function hasActiveSession() {
+        return bridgeSession && Date.now() < bridgeExpiresAt;
+      }
+
+      function sendBridgeInit() {
+        if (!hasActiveSession() || !scannerWindow || scannerWindow.closed) return;
+        reply({
+          type: 'M70_BRIDGE_INIT',
+          channelId: bridgeSession.channelId,
+          expiresAt: bridgeSession.expiresAt,
+          bridgeOrigin: bridgeSession.bridgeOrigin,
+          signature: bridgeSession.signature
+        });
+      }
+
+      function startInitDelivery() {
+        if (initRetryTimer) clearInterval(initRetryTimer);
+        initAttempts = 0;
+        sendBridgeInit();
+        initAttempts += 1;
+        initRetryTimer = setInterval(function () {
+          if (++initAttempts > INIT_MAX_ATTEMPTS || !hasActiveSession()) {
+            clearInterval(initRetryTimer);
+            initRetryTimer = null;
+            if (!hasActiveSession()) requestBridgeSession();
+            else show('Сканер не ответил. Проверьте окно сканера и повторите запуск.', 'error');
+            return;
+          }
+          sendBridgeInit();
+        }, INIT_RETRY_MS);
+      }
+
+      function scheduleRenewal() {
+        if (renewalTimer) clearTimeout(renewalTimer);
+        if (!hasActiveSession()) return requestBridgeSession();
+        const delay = Math.max(0, bridgeExpiresAt - Date.now() - RENEW_MARGIN_MS);
+        renewalTimer = setTimeout(requestBridgeSession, delay);
+      }
+
+      function requestBridgeSession() {
+        if (bridgeStarting || !channelId || !scannerWindow || scannerWindow.closed) return;
+        bridgeStarting = true;
+        google.script.run
+          .withSuccessHandler(function (session) {
+            bridgeStarting = false;
+            if (!session || session.channelId !== channelId ||
+                session.bridgeOrigin !== window.location.origin ||
+                !Number.isSafeInteger(session.expiresAt) || session.expiresAt <= Date.now()) {
+              show('Сервер вернул некорректную bridge-сессию.', 'error');
+              return;
+            }
+            bridgeSession = session;
+            bridgeExpiresAt = session.expiresAt;
+            startInitDelivery();
+          })
+          .withFailureHandler(function (error) {
+            bridgeStarting = false;
+            show(safeFailureMessage(error), 'error');
+          })
+          .createBridgeSession(channelId, window.location.origin);
+      }
+
       function openScanner() {
+        clearBridgeTimers();
         channelId = id();
+        bridgeSession = null;
+        bridgeExpiresAt = 0;
         scannerWindow = window.open(SCANNER_URL, 'm70Scanner-' + channelId);
         if (!scannerWindow) {
           show('Браузер заблокировал новое окно. Разрешите всплывающие окна и повторите.', 'error');
           return;
         }
         show('Окно сканера открыто. Ожидаем защищённое соединение…');
+        requestBridgeSession();
       }
 
       function safeFailureMessage(error) {
@@ -68,25 +148,24 @@
         if (event.origin !== SCANNER_ORIGIN || event.source !== scannerWindow) return;
         const data = event.data;
         if (!data || typeof data !== 'object') return;
-        if (data.type === 'M70_SCANNER_READY') {
-          if (bridgeStarting || !channelId) return;
-          bridgeStarting = true;
-          google.script.run
-            .withSuccessHandler(function (session) {
-              bridgeStarting = false;
-              reply({ type: 'M70_BRIDGE_INIT', channelId: session.channelId,
-                expiresAt: session.expiresAt, signature: session.signature });
-            })
-            .withFailureHandler(function (error) {
-              bridgeStarting = false;
-              show(safeFailureMessage(error), 'error');
-            })
-            .createBridgeSession(channelId);
-          return;
-        }
         if (data.channelId !== channelId) return;
         if (data.type === 'M70_SCANNER_CONNECTED') {
+          if (!hasActiveSession()) return requestBridgeSession();
+          if (initRetryTimer) clearInterval(initRetryTimer);
+          initRetryTimer = null;
+          scheduleRenewal();
           show('✓ Сканер подключён. Отметка прихода разрешена.', 'success');
+          return;
+        }
+        if (!hasActiveSession()) {
+          requestBridgeSession();
+          if (data.type === 'M70_TEST_REQUEST') {
+            reply({ type: 'M70_TEST_RESULT', channelId: channelId,
+              requestId: data.requestId, ok: false, message: 'Сессия регистратора истекла.' });
+          } else if (data.type === 'M70_CHECKIN_REQUEST') {
+            reply({ type: 'M70_CHECKIN_RESULT', channelId: channelId,
+              requestId: data.requestId, status: 'error', message: 'Сессия регистратора истекла.' });
+          }
           return;
         }
         if (serverBusy) {
@@ -131,6 +210,7 @@
 
       document.getElementById('openScanner').addEventListener('click', openScanner);
       window.addEventListener('message', onMessage);
+      window.addEventListener('pagehide', clearBridgeTimers);
     })();
   </script>
 </body>
