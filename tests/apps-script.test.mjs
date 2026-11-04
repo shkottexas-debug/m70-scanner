@@ -5,16 +5,17 @@ import vm from 'node:vm';
 
 const source = await readFile(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
 
-function createHarness(rows = [], activeEmail = 'registrar@example.com') {
+function createHarness(rows = [], activeEmail = 'registrar@example.com', propertyOverrides = {}) {
   const state = {
     rows: rows.map((row) => ({ ...row })), writes: 0, flushes: 0,
-    lockWaits: 0, lockReleases: 0, signedPayload: null
+    lockWaits: 0, lockReleases: 0, signedPayload: null, deletedProperties: []
   };
   let locked = false;
   const properties = {
     SPREADSHEET_ID: 'spreadsheet-id', SHEET_NAME: 'Участники',
     REGISTRAR_EMAILS: 'registrar@example.com', CHECKED_IN_STATUS: 'Пришёл',
-    BRIDGE_PRIVATE_KEY: 'test-private-key'
+    BRIDGE_PRIVATE_KEY: 'test-private-key',
+    ...propertyOverrides
   };
 
   function range(row, column, rowCount = 1, columnCount = 1) {
@@ -39,7 +40,13 @@ function createHarness(rows = [], activeEmail = 'registrar@example.com') {
     console, Date,
     Session: { getActiveUser: () => ({ getEmail: () => activeEmail }) },
     PropertiesService: {
-      getScriptProperties: () => ({ getProperty: (name) => properties[name] || '' })
+      getScriptProperties: () => ({
+        getProperty: (name) => properties[name] || '',
+        deleteProperty(name) {
+          delete properties[name];
+          state.deletedProperties.push(name);
+        }
+      })
     },
     LockService: {
       getScriptLock: () => ({
@@ -155,6 +162,19 @@ test('validates a real-ticket-shaped token without writing attendance', () => {
   assert.equal(result.eligible, true);
   assert.equal(app.state.writes, 0);
   assert.equal(app.state.flushes, 0);
+});
+
+test('one-time validation removes its temporary token property', () => {
+  const app = createHarness(
+    [{ token: 'synthetic-ticket-token', status: 'Зарегистрирован', arrival: '' }],
+    'registrar@example.com',
+    { VALIDATION_TICKET_TOKEN: 'synthetic-ticket-token' }
+  );
+  const result = app.context.validateConfiguredTicketWithoutCheckIn();
+  assert.equal(result.status, 'eligible');
+  assert.equal(app.state.writes, 0);
+  assert.deepEqual(app.state.deletedProperties, ['VALIDATION_TICKET_TOKEN']);
+  assert.throws(() => app.context.validateConfiguredTicketWithoutCheckIn(), /Не задан токен/);
 });
 
 test('issues a short-lived session bound to channel, scanner and Apps Script origin', () => {

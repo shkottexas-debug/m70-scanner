@@ -75,6 +75,23 @@ function validateTicketWithoutCheckIn(token) {
   };
 }
 
+/**
+ * Одноразовый запуск проверки из редактора без помещения токена в исходный код
+ * или параметры CLI. Владелец временно задаёт Script Property
+ * VALIDATION_TICKET_TOKEN; функция удаляет его даже при ошибке.
+ */
+function validateConfiguredTicketWithoutCheckIn() {
+  assertAuthorizedRegistrar_();
+  const properties = PropertiesService.getScriptProperties();
+  const token = properties.getProperty('VALIDATION_TICKET_TOKEN');
+  if (!token) throw new Error('Не задан токен для безопасной проверки.');
+  try {
+    return validateTicketWithoutCheckIn(token);
+  } finally {
+    properties.deleteProperty('VALIDATION_TICKET_TOKEN');
+  }
+}
+
 function createBridgeSession(channelId, bridgeOrigin) {
   assertAuthorizedRegistrar_();
   validateRequestId_(channelId);
