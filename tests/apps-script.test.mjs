@@ -5,17 +5,16 @@ import vm from 'node:vm';
 
 const source = await readFile(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
 
-function createHarness(rows = [], activeEmail = 'registrar@example.com', propertyOverrides = {}) {
+function createHarness(rows = [], activeEmail = 'registrar@example.com') {
   const state = {
     rows: rows.map((row) => ({ ...row })), writes: 0, flushes: 0,
-    lockWaits: 0, lockReleases: 0, signedPayload: null, deletedProperties: []
+    lockWaits: 0, lockReleases: 0, signedPayload: null
   };
   let locked = false;
   const properties = {
     SPREADSHEET_ID: 'spreadsheet-id', SHEET_NAME: 'Участники',
     REGISTRAR_EMAILS: 'registrar@example.com', CHECKED_IN_STATUS: 'Пришёл',
-    BRIDGE_PRIVATE_KEY: 'test-private-key',
-    ...propertyOverrides
+    BRIDGE_PRIVATE_KEY: 'test-private-key'
   };
 
   function range(row, column, rowCount = 1, columnCount = 1) {
@@ -40,13 +39,7 @@ function createHarness(rows = [], activeEmail = 'registrar@example.com', propert
     console, Date,
     Session: { getActiveUser: () => ({ getEmail: () => activeEmail }) },
     PropertiesService: {
-      getScriptProperties: () => ({
-        getProperty: (name) => properties[name] || '',
-        deleteProperty(name) {
-          delete properties[name];
-          state.deletedProperties.push(name);
-        }
-      })
+      getScriptProperties: () => ({ getProperty: (name) => properties[name] || '' })
     },
     LockService: {
       getScriptLock: () => ({
@@ -82,11 +75,12 @@ test('allows only a registered ticket', () => {
   assert.equal(app.state.writes, 1);
 });
 
-test('rejects a confirmed ticket under the production eligibility policy', () => {
+test('allows a confirmed ticket under the production eligibility policy', () => {
   const app = createHarness([{ token: 'token-a', status: 'Подтвердил', arrival: '' }]);
   const result = app.context.checkInFromScanner('token-a', 'request-1234');
-  assert.equal(result.status, 'not_eligible');
-  assert.equal(app.state.writes, 0);
+  assert.equal(result.status, 'checked_in');
+  assert.equal(app.state.rows[0].status, 'Пришёл');
+  assert.equal(app.state.writes, 1);
 });
 
 test('rejects a cancelled ticket without changing the sheet', () => {
@@ -135,6 +129,23 @@ test('returns already_used on repeat and writes exactly once', () => {
   assert.equal(app.state.writes, 1);
 });
 
+test('treats an existing arrival time as already used even if the status was restored', () => {
+  const app = createHarness([{
+    token: 'token-a', status: 'Зарегистрирован', arrival: new Date('2026-11-05T10:00:00Z')
+  }]);
+  const result = app.context.checkInFromScanner('token-a', 'request-1234');
+  assert.equal(result.status, 'already_used');
+  assert.equal(app.state.writes, 0);
+  assert.equal(app.state.lockReleases, 1);
+});
+
+test('treats the checked-in status as already used even if arrival time is empty', () => {
+  const app = createHarness([{ token: 'token-a', status: 'Пришёл', arrival: '' }]);
+  const result = app.context.checkInFromScanner('token-a', 'request-1234');
+  assert.equal(result.status, 'already_used');
+  assert.equal(app.state.writes, 0);
+});
+
 test('serializes two device requests through the script lock', () => {
   const app = createHarness([{ token: 'token-a', status: 'Зарегистрирован', arrival: '' }]);
   const deviceA = app.context.checkInFromScanner('token-a', 'device-a-1234');
@@ -155,26 +166,14 @@ test('keeps authorization mandatory for scanner check-in', () => {
   assert.equal(app.state.writes, 0);
 });
 
-test('validates a real-ticket-shaped token without writing attendance', () => {
-  const app = createHarness([{ token: 'synthetic-ticket-token', status: 'Зарегистрирован', arrival: '' }]);
-  const result = app.context.validateTicketWithoutCheckIn('synthetic-ticket-token');
-  assert.equal(result.status, 'eligible');
-  assert.equal(result.eligible, true);
-  assert.equal(app.state.writes, 0);
-  assert.equal(app.state.flushes, 0);
-});
-
-test('one-time validation removes its temporary token property', () => {
+test('rejects an empty active-user email', () => {
   const app = createHarness(
-    [{ token: 'synthetic-ticket-token', status: 'Зарегистрирован', arrival: '' }],
-    'registrar@example.com',
-    { VALIDATION_TICKET_TOKEN: 'synthetic-ticket-token' }
+    [{ token: 'token-a', status: 'Зарегистрирован', arrival: '' }],
+    ''
   );
-  const result = app.context.validateConfiguredTicketWithoutCheckIn();
-  assert.equal(result.status, 'eligible');
+  assert.throws(() => app.context.checkInFromScanner('token-a', 'request-1234'),
+    /авторизованным регистраторам/);
   assert.equal(app.state.writes, 0);
-  assert.deepEqual(app.state.deletedProperties, ['VALIDATION_TICKET_TOKEN']);
-  assert.throws(() => app.context.validateConfiguredTicketWithoutCheckIn(), /Не задан токен/);
 });
 
 test('issues a short-lived session bound to channel, scanner and Apps Script origin', () => {

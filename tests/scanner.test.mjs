@@ -243,6 +243,21 @@ test('keeps photo scanning as a standalone fallback', async () => {
   assert.match(app.elements.get('result').textContent, /Новый QR-код распознан/);
 });
 
+test('sends a QR decoded from a photo through the authorized check-in path', async () => {
+  const messages = [];
+  const bridgeWindow = { closed: false, postMessage(message) { messages.push(message); } };
+  const app = createHarness();
+  await connectBridge(app, bridgeWindow);
+  const input = app.elements.get('photoInput');
+  input.files = [{ name: 'qr.jpg', type: 'image/jpeg' }];
+
+  await input.handlers.change({ target: input });
+
+  const request = messages.find((message) => message.type === 'M70_CHECKIN_REQUEST');
+  assert.equal(request.token, 'photo-token');
+  assert.equal(app.elements.get('confirmedCount').textContent, '0');
+});
+
 test('rejects an Apps Script parent with an invalid server signature', async () => {
   const bridgeWindow = { closed: false, postMessage() {} };
   const app = createHarness({ bridgeVerified: false });
