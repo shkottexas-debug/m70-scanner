@@ -35,10 +35,18 @@ function createHarness({ bridgeVerified = true } = {}) {
 
   class FakeScanner {
     static instance = null;
-    constructor() { FakeScanner.instance = this; }
-    async start(_camera, _config, onSuccess) { this.onSuccess = onSuccess; }
-    async stop() {}
-    clear() {}
+    constructor() {
+      FakeScanner.instance = this;
+      this.startCalls = 0;
+      this.stopCalls = 0;
+      this.clearCalls = 0;
+    }
+    async start(_camera, _config, onSuccess) {
+      this.startCalls += 1;
+      this.onSuccess = onSuccess;
+    }
+    async stop() { this.stopCalls += 1; }
+    clear() { this.clearCalls += 1; }
     async scanFile() { return 'photo-token'; }
   }
 
@@ -89,11 +97,31 @@ test('counts only unique QR codes in standalone test mode', () => {
 
 test('starts camera once and keeps the success callback active', async () => {
   const app = createHarness();
+  app.elements.get('startBtn').handlers.click();
+  await new Promise((resolve) => setImmediate(resolve));
   await app.elements.get('startBtn').handlers.click();
+  assert.equal(app.FakeScanner.instance.startCalls, 1);
   app.FakeScanner.instance.onSuccess('token-a');
   app.FakeScanner.instance.onSuccess('token-b');
   assert.equal(app.elements.get('stopBtn').disabled, false);
   assert.equal(app.elements.get('count').textContent, '2');
+});
+
+test('stops and clears the active camera before allowing another start', async () => {
+  const app = createHarness();
+  app.elements.get('startBtn').handlers.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  const firstScanner = app.FakeScanner.instance;
+  app.elements.get('stopBtn').handlers.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(firstScanner.stopCalls, 1);
+  assert.equal(firstScanner.clearCalls, 1);
+  assert.equal(app.elements.get('startBtn').disabled, false);
+  assert.equal(app.elements.get('stopBtn').disabled, true);
+
+  app.elements.get('startBtn').handlers.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.notEqual(app.FakeScanner.instance, firstScanner);
 });
 
 test('ignores unsigned bridge messages from an unexpected origin', async () => {
@@ -220,5 +248,5 @@ test('rejects an Apps Script parent with an invalid server signature', async () 
   const app = createHarness({ bridgeVerified: false });
   await connectBridge(app, bridgeWindow);
   assert.match(app.elements.get('mode').textContent, /Тестовый режим/);
-  assert.match(app.elements.get('result').textContent, /подлинность/);
+  assert.match(app.elements.get('connectionStatus').textContent, /подлинность/);
 });

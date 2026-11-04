@@ -22,6 +22,10 @@
     #result.success { background: #d9f5df; }
     #result.warning { background: #fff4cc; }
     #result.error { background: #ffdddd; }
+    .connection-status { margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: #edf2f7; color: #475569; font-size: 14px; }
+    .connection-status.success { background: #d9f5df; color: #166534; }
+    .connection-status.warning { background: #fff4cc; color: #854d0e; }
+    .connection-status.error { background: #ffdddd; color: #991b1b; }
     .counters { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; text-align: center; }
     .counter { padding: 10px; border-radius: 8px; background: #f8fafc; }
     .counter strong { display: block; font-size: 22px; }
@@ -33,6 +37,7 @@
     <h1>М70 · Сканер</h1>
     <p>Кооператив М70 · Томск</p>
     <p id="mode">Определение режима…</p>
+    <div id="connectionStatus" class="connection-status" role="status" aria-live="polite">Приложение регистратора не подключено</div>
     <button id="startBtn" type="button">📷 Начать сканирование</button>
     <button id="stopBtn" type="button" class="secondary" disabled>Остановить камеру</button>
     <label for="photoInput" class="file-button secondary">Выбрать фотографию QR</label>

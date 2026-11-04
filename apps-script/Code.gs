@@ -13,7 +13,7 @@ const FIRST_DATA_ROW = 2;
 const LOCK_TIMEOUT_MS = 10000;
 const SCANNER_ORIGIN = 'https://shkottexas-debug.github.io';
 const BRIDGE_SESSION_TTL_MS = 5 * 60 * 1000;
-const ELIGIBLE_STATUSES = ['Зарегистрирован', 'Подтвердил'];
+const ELIGIBLE_STATUSES = ['Зарегистрирован'];
 
 function doGet() {
   assertAuthorizedRegistrar_();
@@ -39,6 +39,40 @@ function healthCheck(requestId) {
   assertAuthorizedRegistrar_();
   validateRequestId_(requestId);
   return { ok: true, requestId: requestId };
+}
+
+/**
+ * Безопасная ручная проверка настоящего билета без отметки прихода.
+ * Возвращает только категорию результата и не раскрывает ID, ФИО, email,
+ * QR-токен или исходное значение статуса.
+ */
+function validateTicketWithoutCheckIn(token) {
+  assertAuthorizedRegistrar_();
+  const normalizedToken = normalizeToken_(token);
+  const config = getConfig_();
+  const sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName(config.sheetName);
+  if (!sheet) throw new Error('Лист регистрации не найден.');
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < FIRST_DATA_ROW) return { status: 'not_found', eligible: false };
+  const rowCount = lastRow - FIRST_DATA_ROW + 1;
+  const tokenValues = sheet.getRange(FIRST_DATA_ROW, TOKEN_COLUMN, rowCount, 1).getDisplayValues();
+  const tokenOffset = tokenValues.findIndex(function (row) {
+    return String(row[0]).trim() === normalizedToken;
+  });
+  if (tokenOffset === -1) return { status: 'not_found', eligible: false };
+
+  const rowNumber = FIRST_DATA_ROW + tokenOffset;
+  const status = String(sheet.getRange(rowNumber, STATUS_COLUMN).getDisplayValue()).trim();
+  const arrivalTime = sheet.getRange(rowNumber, ARRIVAL_COLUMN).getValue();
+  if (arrivalTime || status === config.checkedInStatus) {
+    return { status: 'already_used', eligible: false };
+  }
+  const eligibility = classifyEligibility_(status);
+  return {
+    status: eligibility === 'eligible' ? 'eligible' : eligibility,
+    eligible: eligibility === 'eligible'
+  };
 }
 
 function createBridgeSession(channelId, bridgeOrigin) {

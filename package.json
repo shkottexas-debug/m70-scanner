@@ -3,6 +3,6 @@
   "private": true,
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check scanner.js && node --check tests/scanner.test.mjs && node --check tests/apps-script.test.mjs && node --check tests/registrar.test.mjs"
+    "check": "node --check scanner.js && node --check --input-type=commonjs < apps-script/Code.gs && node --check tests/scanner.test.mjs && node --check tests/network.test.mjs && node --check tests/apps-script.test.mjs && node --check tests/registrar.test.mjs"
   }
 }
