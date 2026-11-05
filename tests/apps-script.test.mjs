@@ -5,16 +5,17 @@ import vm from 'node:vm';
 
 const source = await readFile(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
 
-function createHarness(rows = [], activeEmail = 'registrar@example.com') {
+function createHarness(rows = [], activeEmail = 'registrar@example.com', propertyOverrides = {}) {
   const state = {
     rows: rows.map((row) => ({ ...row })), writes: 0, flushes: 0,
-    lockWaits: 0, lockReleases: 0, signedPayload: null
+    lockWaits: 0, lockReleases: 0, signedPayload: null, deletedProperties: []
   };
   let locked = false;
   const properties = {
     SPREADSHEET_ID: 'spreadsheet-id', SHEET_NAME: 'Участники',
     REGISTRAR_EMAILS: 'registrar@example.com', CHECKED_IN_STATUS: 'Пришёл',
-    BRIDGE_PRIVATE_KEY: 'test-private-key'
+    BRIDGE_PRIVATE_KEY: 'test-private-key',
+    ...propertyOverrides
   };
 
   function range(row, column, rowCount = 1, columnCount = 1) {
@@ -23,7 +24,11 @@ function createHarness(rows = [], activeEmail = 'registrar@example.com') {
         assert.equal(column, 6);
         return state.rows.slice(row - 2, row - 2 + rowCount).map((item) => [item.token]);
       },
-      getDisplayValue() { assert.equal(column, 4); return state.rows[row - 2].status; },
+      getDisplayValue() {
+        if (column === 1) return state.rows[row - 2].id || '';
+        assert.equal(column, 4);
+        return state.rows[row - 2].status;
+      },
       getValue() { assert.equal(column, 5); return state.rows[row - 2].arrival || ''; },
       setValues(values) {
         assert.equal(column, 4);
@@ -39,7 +44,13 @@ function createHarness(rows = [], activeEmail = 'registrar@example.com') {
     console, Date,
     Session: { getActiveUser: () => ({ getEmail: () => activeEmail }) },
     PropertiesService: {
-      getScriptProperties: () => ({ getProperty: (name) => properties[name] || '' })
+      getScriptProperties: () => ({
+        getProperty: (name) => properties[name] || '',
+        deleteProperty(name) {
+          delete properties[name];
+          state.deletedProperties.push(name);
+        }
+      })
     },
     LockService: {
       getScriptLock: () => ({
@@ -174,6 +185,44 @@ test('rejects an empty active-user email', () => {
   assert.throws(() => app.context.checkInFromScanner('token-a', 'request-1234'),
     /авторизованным регистраторам/);
   assert.equal(app.state.writes, 0);
+});
+
+test('validates a configured real ticket without writing attendance', () => {
+  const app = createHarness(
+    [{ id: 'M70-001', token: 'synthetic-ticket-token', status: 'Зарегистрирован', arrival: '' }],
+    'registrar@example.com',
+    { VALIDATION_TICKET_TOKEN: 'synthetic-ticket-token' }
+  );
+  const result = app.context.validateConfiguredTicketWithoutCheckIn();
+  assert.equal(result.status, 'eligible');
+  assert.equal(result.eligible, true);
+  assert.equal(app.state.writes, 0);
+  assert.equal(app.state.flushes, 0);
+  assert.deepEqual(app.state.deletedProperties, ['VALIDATION_TICKET_TOKEN']);
+});
+
+test('writes attendance only for the explicitly configured TEST row', () => {
+  const app = createHarness(
+    [{ id: 'TEST-CHECKIN-001', token: 'synthetic-test-token', status: 'Подтвердил', arrival: '' }],
+    'registrar@example.com',
+    { TEST_TICKET_ID: 'TEST-CHECKIN-001', TEST_TICKET_TOKEN: 'synthetic-test-token' }
+  );
+  const result = app.context.checkInConfiguredTestTicket();
+  assert.equal(result.status, 'checked_in');
+  assert.equal(app.state.rows[0].status, 'Пришёл');
+  assert.equal(app.state.writes, 1);
+  assert.deepEqual(app.state.deletedProperties, ['TEST_TICKET_ID', 'TEST_TICKET_TOKEN']);
+});
+
+test('refuses to use the configured test helper on a real M70 row', () => {
+  const app = createHarness(
+    [{ id: 'M70-001', token: 'synthetic-real-token', status: 'Зарегистрирован', arrival: '' }],
+    'registrar@example.com',
+    { TEST_TICKET_ID: 'TEST-CHECKIN-001', TEST_TICKET_TOKEN: 'synthetic-real-token' }
+  );
+  assert.throws(() => app.context.checkInConfiguredTestTicket(), /тестовой строке/);
+  assert.equal(app.state.writes, 0);
+  assert.deepEqual(app.state.deletedProperties, ['TEST_TICKET_ID', 'TEST_TICKET_TOKEN']);
 });
 
 test('issues a short-lived session bound to channel, scanner and Apps Script origin', () => {

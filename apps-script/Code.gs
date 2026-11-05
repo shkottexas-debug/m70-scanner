@@ -41,6 +41,43 @@ function healthCheck(requestId) {
   return { ok: true, requestId: requestId };
 }
 
+/**
+ * Проверяет билет из временного Script Property без записи D/E и без возврата
+ * ID, токена, персональных данных или исходного текста статуса.
+ */
+function validateConfiguredTicketWithoutCheckIn() {
+  assertAuthorizedRegistrar_();
+  const properties = PropertiesService.getScriptProperties();
+  const token = properties.getProperty('VALIDATION_TICKET_TOKEN');
+  if (!token) throw new Error('Не задан токен для безопасной проверки.');
+  try {
+    return validateTicketWithoutCheckIn_(token);
+  } finally {
+    properties.deleteProperty('VALIDATION_TICKET_TOKEN');
+  }
+}
+
+/**
+ * Выполняется вручную из редактора только для строки с ID, начинающимся TEST-.
+ * Оба временных свойства удаляются после запуска, включая ошибочный запуск.
+ */
+function checkInConfiguredTestTicket() {
+  assertAuthorizedRegistrar_();
+  const properties = PropertiesService.getScriptProperties();
+  try {
+    const ticketId = String(properties.getProperty('TEST_TICKET_ID') || '').trim();
+    const token = properties.getProperty('TEST_TICKET_TOKEN');
+    if (!/^TEST-[A-Z0-9-]{1,64}$/.test(ticketId)) {
+      throw new Error('TEST_TICKET_ID должен начинаться с TEST-.');
+    }
+    if (!token) throw new Error('Не задан токен тестовой строки.');
+    return checkIn_(token, 'test-' + Utilities.getUuid(), ticketId);
+  } finally {
+    properties.deleteProperty('TEST_TICKET_ID');
+    properties.deleteProperty('TEST_TICKET_TOKEN');
+  }
+}
+
 function createBridgeSession(channelId, bridgeOrigin) {
   assertAuthorizedRegistrar_();
   validateRequestId_(channelId);
@@ -60,7 +97,7 @@ function createBridgeSession(channelId, bridgeOrigin) {
   };
 }
 
-function checkIn_(rawToken, requestId) {
+function checkIn_(rawToken, requestId, expectedTestTicketId) {
   const token = normalizeToken_(rawToken);
   const config = getConfig_();
   const lock = LockService.getScriptLock();
@@ -81,6 +118,13 @@ function checkIn_(rawToken, requestId) {
     if (tokenOffset === -1) return response_('not_found', 'Билет не найден', requestId);
 
     const rowNumber = FIRST_DATA_ROW + tokenOffset;
+    if (expectedTestTicketId) {
+      const actualTicketId = String(sheet.getRange(rowNumber, 1).getDisplayValue()).trim();
+      if (!/^TEST-[A-Z0-9-]{1,64}$/.test(actualTicketId) ||
+          actualTicketId !== expectedTestTicketId) {
+        throw new Error('Токен не принадлежит указанной тестовой строке.');
+      }
+    }
     const status = String(sheet.getRange(rowNumber, STATUS_COLUMN).getDisplayValue()).trim();
     const arrivalTime = sheet.getRange(rowNumber, ARRIVAL_COLUMN).getValue();
 
@@ -118,6 +162,34 @@ function checkIn_(rawToken, requestId) {
   } finally {
     if (lock.hasLock()) lock.releaseLock();
   }
+}
+
+function validateTicketWithoutCheckIn_(rawToken) {
+  const token = normalizeToken_(rawToken);
+  const config = getConfig_();
+  const sheet = SpreadsheetApp.openById(config.spreadsheetId).getSheetByName(config.sheetName);
+  if (!sheet) throw new Error('Лист регистрации не найден.');
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < FIRST_DATA_ROW) return { status: 'not_found', eligible: false };
+  const rowCount = lastRow - FIRST_DATA_ROW + 1;
+  const tokenValues = sheet.getRange(FIRST_DATA_ROW, TOKEN_COLUMN, rowCount, 1).getDisplayValues();
+  const tokenOffset = tokenValues.findIndex(function (row) {
+    return String(row[0]).trim() === token;
+  });
+  if (tokenOffset === -1) return { status: 'not_found', eligible: false };
+
+  const rowNumber = FIRST_DATA_ROW + tokenOffset;
+  const status = String(sheet.getRange(rowNumber, STATUS_COLUMN).getDisplayValue()).trim();
+  const arrivalTime = sheet.getRange(rowNumber, ARRIVAL_COLUMN).getValue();
+  if (arrivalTime || status === config.checkedInStatus) {
+    return { status: 'already_used', eligible: false };
+  }
+  const eligibility = classifyEligibility_(status);
+  return {
+    status: eligibility === 'eligible' ? 'eligible' : eligibility,
+    eligible: eligibility === 'eligible'
+  };
 }
 
 function assertAuthorizedRegistrar_() {
